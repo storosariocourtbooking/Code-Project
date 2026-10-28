@@ -8,7 +8,6 @@ import { isSupabaseConfigured, supabase } from './supabase'
 const COURT_NAME = import.meta.env.VITE_COURT_NAME || 'Barangay Covered Court'
 const START_HOUR = Number((import.meta.env.VITE_BOOKING_START || '06:00').split(':')[0])
 const END_HOUR = Number((import.meta.env.VITE_BOOKING_END || '22:00').split(':')[0])
-const ADMIN_PIN = import.meta.env.VITE_ADMIN_PIN || '1234'
 const GCASH_QR = import.meta.env.VITE_GCASH_QR || '/payment/gcash-qr.png'
 const MARIBANK_QR = import.meta.env.VITE_MARIBANK_QR || '/payment/maribank-qr.png'
 const LOCAL_KEY = 'barangay-court-bookings-v1'
@@ -40,7 +39,8 @@ export default function App() {
   const [loading, setLoading] = useState(true)
   const [notice, setNotice] = useState(null)
   const [adminUnlocked, setAdminUnlocked] = useState(false)
-  const [pin, setPin] = useState('')
+  const [adminEmail, setAdminEmail] = useState('')
+  const [adminPassword, setAdminPassword] = useState('')
   const [month, setMonth] = useState(() => new Date())
   const [form, setForm] = useState({
     firstName: '', lastName: '', email: '', purpose: 'Pickleball', otherPurpose: '',
@@ -49,21 +49,45 @@ export default function App() {
     paymentMethod: 'GCash', paymentProof: null
   })
 
-  useEffect(() => { loadBookings() }, [])
+  useEffect(() => {
+    loadBookings()
+    if (!isSupabaseConfigured) return
+    supabase.auth.getSession().then(async ({data}) => {
+      if (data.session) await verifyAdmin()
+    })
+  }, [])
+
+  async function verifyAdmin() {
+    const { data, error } = await supabase.rpc('is_court_admin')
+    if (error || data !== true) { setAdminUnlocked(false); return false }
+    setAdminUnlocked(true)
+    return true
+  }
+
 
   async function loadBookings() {
     setLoading(true)
-    if (isSupabaseConfigured) {
-      const { data, error } = await supabase.from('bookings')
-        .select('*').order('booking_date').order('start_time')
-      if (error) {
-        setNotice({ type: 'error', text: `Could not load bookings: ${error.message}` })
-        setBookings([])
-      } else setBookings((data || []).map(fromDb))
-    } else {
-      setBookings(readLocal())
-    }
-    setLoading(false)
+    try {
+      if (isSupabaseConfigured) {
+        // Public callers receive only schedule fields, never names or receipts.
+        const { data, error } = await supabase.rpc('public_court_availability')
+        if (error) throw error
+        setBookings((data || []).map(row => ({
+          id: row.id, date: row.booking_date,
+          start: String(row.start_time).slice(0, 5),
+          end: String(row.end_time).slice(0, 5), status: 'approved'
+        })))
+      } else setBookings(readLocal())
+    } catch (err) {
+      setBookings([])
+      setNotice({ type: 'error', text: `Could not load bookings: ${err.message || 'Network connection failed'}` })
+    } finally { setLoading(false) }
+  }
+
+  async function loadAdminBookings() {
+    const { data, error } = await supabase.from('bookings').select('*').order('booking_date').order('start_time')
+    if (error) { setNotice({type: 'error', text: error.message}); return }
+    setBookings((data || []).map(fromDb))
   }
 
   function fromDb(row) {
@@ -148,13 +172,12 @@ export default function App() {
       let proofUrl = ''
       if (isSupabaseConfigured) {
         const ext = form.paymentProof.name.split('.').pop()?.toLowerCase() || 'jpg'
-        const filePath = `payment-proofs/${crypto.randomUUID()}.${ext}`
+        const filePath = `${crypto.randomUUID()}.${ext}`
         const { error: uploadError } = await supabase.storage.from('payment-proofs').upload(filePath, form.paymentProof, {
           contentType: form.paymentProof.type, upsert: false
         })
         if (uploadError) throw uploadError
-        const { data: urlData } = supabase.storage.from('payment-proofs').getPublicUrl(filePath)
-        proofUrl = urlData.publicUrl
+        proofUrl = filePath // Private bucket: store path, not a public URL
         const { data, error } = await supabase.rpc('create_court_booking', {
           p_first_name: form.firstName.trim(), p_last_name: form.lastName.trim(),
           p_email: form.email.trim(), p_purpose: form.purpose,
@@ -185,20 +208,43 @@ export default function App() {
   async function updateStatus(id, status) {
     setNotice(null)
     if (isSupabaseConfigured) {
+      if (!adminUnlocked || !(await verifyAdmin())) { setNotice({type:'error',text:'Admin access required.'}); return }
       const { error } = await supabase.from('bookings').update({ status }).eq('id', id)
       if (error) { setNotice({ type: 'error', text: error.message }); return }
-      await loadBookings()
+      await loadAdminBookings()
     } else {
-      const updated = readLocal().map(b => b.id === id ? { ...b, status } : b)
-      localStorage.setItem(LOCAL_KEY, JSON.stringify(updated)); setBookings(updated)
+      setNotice({type:'error', text:'Admin changes require Supabase.'}); return
     }
     setNotice({ type: 'success', text: `Booking marked ${statusText(status).toLowerCase()}.` })
   }
 
-  function unlockAdmin(e) {
+  async function unlockAdmin(e) {
     e.preventDefault()
-    if (pin === ADMIN_PIN) { setAdminUnlocked(true); setPin(''); setPage('admin'); setNotice(null) }
-    else setNotice({ type: 'error', text: 'Incorrect demo admin PIN.' })
+    setNotice(null)
+    if (!isSupabaseConfigured) { setNotice({type:'error',text:'Configure Supabase first.'}); return }
+    const { error } = await supabase.auth.signInWithPassword({email:adminEmail.trim(), password:adminPassword})
+    setAdminPassword('')
+    if (error || !(await verifyAdmin())) {
+      await supabase.auth.signOut()
+      setNotice({type:'error',text:'Invalid login or account is not authorized as an administrator.'})
+      return
+    }
+    setPage('admin')
+    await loadAdminBookings()
+  }
+
+  async function openProof(path) {
+    if (!path || !adminUnlocked) return
+    const { data, error } = await supabase.storage.from('payment-proofs').createSignedUrl(path, 60)
+    if (error) setNotice({type:'error',text:error.message})
+    else window.open(data.signedUrl, '_blank', 'noopener,noreferrer')
+  }
+
+  async function exitAdmin() {
+    await supabase.auth.signOut()
+    setAdminUnlocked(false)
+    setPage('admin-login')
+    await loadBookings()
   }
 
   function goPage(p) { setPage(p); setMobileMenu(false); setNotice(null) }
@@ -214,7 +260,7 @@ export default function App() {
         <nav className={mobileMenu ? 'nav open' : 'nav'}>
           <button className={page === 'book' ? 'nav-link active' : 'nav-link'} onClick={() => goPage('book')}>Book a Court</button>
           <button className={page === 'availability' ? 'nav-link active' : 'nav-link'} onClick={() => goPage('availability')}>Availability</button>
-          <button className="nav-link admin-nav" onClick={() => goPage(adminUnlocked ? 'admin' : 'admin-login')}>Admin</button>
+          <button className="nav-link admin-nav" onClick={async () => { if (adminUnlocked) { await loadAdminBookings(); goPage('admin') } else goPage('admin-login') }}>Admin</button>
         </nav>
       </div>
     </header>
@@ -299,12 +345,12 @@ export default function App() {
           })}</div><button className="primary-button" onClick={() => goPage('book')}>Book an available time <span>→</span></button></div>
         </div>}
 
-        {page === 'admin-login' && <div className="panel login-panel"><div className="login-icon"><ShieldCheck size={27}/></div><h3>Administrator sign in</h3><p>Enter your administrator PIN to manage booking requests.</p><form onSubmit={unlockAdmin}><label>Admin PIN<input type="password" value={pin} onChange={e => setPin(e.target.value)} placeholder="Enter PIN" required/></label><button className="primary-button" type="submit">Open dashboard <span>→</span></button></form><p className="terms-note">Demo PIN: 1234. Change VITE_ADMIN_PIN in your environment settings before deployment. For a public launch, replace this demo PIN with secure server-side authentication.</p></div>}
+        {page === 'admin-login' && <div className="panel login-panel"><div className="login-icon"><ShieldCheck size={27}/></div><h3>Administrator sign in</h3><p>Sign in using your approved Supabase administrator account.</p><form onSubmit={unlockAdmin}><label>Email<input type="email" value={adminEmail} onChange={e => setAdminEmail(e.target.value)} placeholder="admin@example.com" required/></label><label>Password<input type="password" value={adminPassword} onChange={e => setAdminPassword(e.target.value)} placeholder="Password" required/></label><button className="primary-button" type="submit">Open dashboard <span>→</span></button></form><p className="terms-note">Administrator accounts must be created in Supabase Auth and authorized in the court_admins table.</p></div>}
 
         {page === 'admin' && adminUnlocked && <div className="admin-area">
-          <div className="admin-toolbar"><div className="admin-stats"><div className="stat-card"><span>Total requests</span><strong>{bookings.length}</strong></div><div className="stat-card"><span>Pending</span><strong>{bookings.filter(b => b.status === 'pending').length}</strong></div><div className="stat-card"><span>Approved</span><strong>{bookings.filter(b => b.status === 'approved').length}</strong></div></div><div className="admin-actions"><button className="outline-button" onClick={loadBookings}><RefreshCw size={16}/> Refresh</button><button className="outline-button" onClick={() => {setAdminUnlocked(false);goPage('admin-login')}}><LogOut size={16}/> Sign out</button></div></div>
+          <div className="admin-toolbar"><div className="admin-stats"><div className="stat-card"><span>Total requests</span><strong>{bookings.length}</strong></div><div className="stat-card"><span>Pending</span><strong>{bookings.filter(b => b.status === 'pending').length}</strong></div><div className="stat-card"><span>Approved</span><strong>{bookings.filter(b => b.status === 'approved').length}</strong></div></div><div className="admin-actions"><button className="outline-button" onClick={loadAdminBookings}><RefreshCw size={16}/> Refresh</button><button className="outline-button" onClick={exitAdmin}><LogOut size={16}/> Sign out</button></div></div>
           <div className="panel table-panel"><div className="table-heading"><div><h3>Reservation requests</h3><p>Review details and verify the uploaded payment proof.</p></div></div>
-            {bookings.length === 0 ? <div className="empty-state"><ClipboardList size={30}/><strong>No booking requests yet</strong><p>Submitted reservations will appear here.</p></div> : <div className="booking-cards">{[...bookings].sort((a,b) => (a.date+a.start).localeCompare(b.date+b.start)).map(b => <article className="admin-booking" key={b.id}><div className="admin-booking-top"><span className={`status-pill ${b.status}`}>{statusText(b.status)}</span><small>{b.id.slice(0,8)}</small></div><h4>{b.firstName} {b.lastName}</h4><p className="admin-email">{b.email}</p><div className="admin-detail-grid"><span><CalendarDays size={15}/>{formatDate(b.date)}</span><span><Clock3 size={15}/>{b.start}–{b.end}</span><span><ClipboardList size={15}/>{b.purpose === 'Other' ? b.otherPurpose : b.purpose}</span><span><CreditCard size={15}/>{b.paymentMethod}</span></div><div className="proof-link">{b.paymentProofUrl && b.paymentProofUrl !== 'local-demo-upload' ? <a href={b.paymentProofUrl} target="_blank" rel="noreferrer">View payment screenshot ↗</a> : <span>Payment screenshot uploaded in demo mode</span>}</div><div className="admin-booking-actions">{b.status !== 'approved' && <button className="approve-button" onClick={() => updateStatus(b.id,'approved')}>Approve</button>}{b.status !== 'rejected' && <button className="reject-button" onClick={() => updateStatus(b.id,'rejected')}>Reject</button>}{b.status !== 'cancelled' && <button className="cancel-button" onClick={() => updateStatus(b.id,'cancelled')}>Cancel</button>}</div></article>)}</div>}
+            {bookings.length === 0 ? <div className="empty-state"><ClipboardList size={30}/><strong>No booking requests yet</strong><p>Submitted reservations will appear here.</p></div> : <div className="booking-cards">{[...bookings].sort((a,b) => (a.date+a.start).localeCompare(b.date+b.start)).map(b => <article className="admin-booking" key={b.id}><div className="admin-booking-top"><span className={`status-pill ${b.status}`}>{statusText(b.status)}</span><small>{b.id.slice(0,8)}</small></div><h4>{b.firstName} {b.lastName}</h4><p className="admin-email">{b.email}</p><div className="admin-detail-grid"><span><CalendarDays size={15}/>{formatDate(b.date)}</span><span><Clock3 size={15}/>{b.start}–{b.end}</span><span><ClipboardList size={15}/>{b.purpose === 'Other' ? b.otherPurpose : b.purpose}</span><span><CreditCard size={15}/>{b.paymentMethod}</span></div><div className="proof-link">{b.paymentProofUrl && b.paymentProofUrl !== 'local-demo-upload' ? <button type="button" className="outline-button" onClick={() => openProof(b.paymentProofUrl)}>View payment screenshot ↗</button> : <span>Payment screenshot uploaded in demo mode</span>}</div><div className="admin-booking-actions">{b.status !== 'approved' && <button className="approve-button" onClick={() => updateStatus(b.id,'approved')}>Approve</button>}{b.status !== 'rejected' && <button className="reject-button" onClick={() => updateStatus(b.id,'rejected')}>Reject</button>}{b.status !== 'cancelled' && <button className="cancel-button" onClick={() => updateStatus(b.id,'cancelled')}>Cancel</button>}</div></article>)}</div>}
           </div>
         </div>}
         {page === 'admin' && !adminUnlocked && <div className="panel login-panel"><h3>Admin session ended</h3><p>Please sign in to continue.</p><button className="primary-button" onClick={() => goPage('admin-login')}>Sign in <span>→</span></button></div>}
